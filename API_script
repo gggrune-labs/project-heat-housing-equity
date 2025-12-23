@@ -1,0 +1,7 @@
+BASE_URL = "https://data.cityofnewyork.us/api/v3/views/erm2-nwe9/query.json"
+
+START_DATE = "2018-01-01T00:00:00"
+END_DATE   = "2024-12-31T23:59:59"
+
+BATCH_SIZE = 50000
+MAX_ROWS   = 150000
