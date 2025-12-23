@@ -1,0 +1,8 @@
+src/
+├─ __init__.py
+├─ config.py
+├─ ingest.py
+├─ clean.py
+├─ features.py
+├─ stats.py
+└─ viz.py
