@@ -1,0 +1,293 @@
+import requests
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+from sklearn.cluster import KMeans
+from sklearn.preprocessing import StandardScaler
+import statsmodels.api as sm
+import statsmodels.formula.api as smf
+
+BASE_URL = "https://data.cityofnewyork.us/api/v3/views/erm2-nwe9/query.json"
+
+START_DATE = "2018-01-01T00:00:00"
+END_DATE   = "2024-12-31T23:59:59"
+
+BATCH_SIZE = 50000
+MAX_ROWS   = 150000
+
+def fetch_311_data_by_years(start_year=2018, end_year=2024, per_year_limit=25000):
+    """
+    Fetch up to `per_year_limit` complaints for each year between start_year and end_year (inclusive).
+    This spreads the sample across years so the time series + ANCOVA actually work.
+    """
+    all_frames = []
+
+    for year in range(start_year, end_year + 1):
+        year_start = f"{year}-01-01T00:00:00"
+        year_end   = f"{year}-12-31T23:59:59"
+
+        params = {
+            "$select":
+                "unique_key,created_date,closed_date,borough,"
+                "complaint_type,descriptor,incident_zip,latitude,longitude",
+            "$where":
+                f"created_date between '{year_start}' and '{year_end}' "
+                "AND borough IS NOT NULL "
+                "AND complaint_type IS NOT NULL",
+            "$limit": per_year_limit
+            # no $offset – we just take a reasonable slice per year
+        }
+
+        print(f"Fetching up to {per_year_limit} rows for {year}...")
+        resp = requests.get(BASE_URL, params=params)
+        print(f"Request URL: {resp.url}") # Debugging line
+        print(f"Status Code: {resp.status_code}") # Debugging line
+        resp.raise_for_status()
+        data = resp.json()
+
+        if not data:
+            print(f"No data returned for {year}.")
+            continue
+
+        yearly_df = pd.DataFrame(data)
+        yearly_df["fetch_year"] = year  # small tag just in case you want to check later
+        all_frames.append(yearly_df)
+        print(f"Got {len(yearly_df):,} rows for {year}.")
+
+    if not all_frames:
+        print("No data fetched for any year.")
+        return pd.DataFrame()
+
+    combined = pd.concat(all_frames, ignore_index=True)
+    print(f"\nTotal combined rows across years: {len(combined):,}")
+    return combined
+
+def clean_311(df):
+    if df.empty:
+        print("Input DataFrame to clean_311 is empty. Returning empty DataFrame.")
+        return df
+
+    df.columns = (
+        df.columns
+        .str.strip()
+        .str.lower()
+        .str.replace(" ", "_")
+    )
+
+    df["created_date"] = pd.to_datetime(df["created_date"], errors="coerce")
+    df["closed_date"]  = pd.to_datetime(df["closed_date"], errors="coerce")
+
+    df = df.dropna(subset=["created_date", "borough"])
+
+    df = df[df["borough"].isin(["BRONX", "BROOKLYN", "MANHATTAN", "QUEENS", "STATEN ISLAND"])]
+
+    df = df[(df["created_date"] >= START_DATE) &
+            (df["created_date"] <= END_DATE)]
+
+    df["year"] = df["created_date"].dt.year
+    df["month"] = df["created_date"].dt.month
+    df["month_period"] = df["created_date"].dt.to_period("M")
+
+    df["complaint_duration_days"] = (
+        (df["closed_date"] - df["created_date"])
+        .dt.total_seconds() / 86400.0
+    )
+    df["complaint_duration_days"] = df["complaint_duration_days"].replace(
+        [np.inf, -np.inf], np.nan
+    )
+
+    df["latitude"] = pd.to_numeric(df["latitude"], errors="coerce")
+    df["longitude"] = pd.to_numeric(df["longitude"], errors="coerce")
+
+    return df
+
+def save_data_to_csv(df, filename='cleaned_311_data.csv'):
+    """
+    Saves the given DataFrame to a CSV file.
+    """
+    df.to_csv(filename, index=False)
+    print(f"Data saved to {filename}")
+
+def top_8_by_borough(df):
+    boroughs = df["borough"].unique()
+    results = {}
+
+    for b in boroughs:
+        subset = df[df["borough"] == b]
+        top8 = (
+            subset["complaint_type"]
+            .value_counts()
+            .head(8)
+            .reset_index()
+            .rename(columns={"index": "complaint_type", "complaint_type": "count"})
+        )
+        results[b] = top8
+
+    return results
+
+
+def print_top_8_by_borough(df):
+    results = top_8_by_borough(df)
+
+    print(" TOP 8 COMPLAINT TYPES BY BOROUGH (2018–2024)")
+    print("===============================\n")
+
+    for b, table in results.items():
+        print(f"\n--- {b} ---")
+        print(table.to_string(index=False))
+
+def build_time_series(df):
+
+    ts = (
+        df.groupby(["month_period", "borough"])
+          .size()
+          .reset_index(name="complaint_count")
+    )
+
+    ts["month_start"] = ts["month_period"].dt.to_timestamp()
+
+    ts = ts.sort_values("month_start")
+
+    ts["time_index"] = (
+        (ts["month_start"].dt.year - ts["month_start"].dt.year.min()) * 12
+        + (ts["month_start"].dt.month - ts["month_start"].dt.month.min())
+    )
+
+    return ts
+
+
+def plot_time_series(ts):
+
+    plt.figure(figsize=(10, 6))
+    for b in ts["borough"].unique():
+        subset = ts[ts["borough"] == b]
+        plt.plot(subset["month_start"], subset["complaint_count"], label=b)
+
+    plt.title("Monthly Complaint Trends by Borough (2018–2024)")
+    plt.xlabel("Month")
+    plt.ylabel("Monthly Complaint Count")
+    plt.legend()
+    plt.grid(True)
+    plt.tight_layout()
+    plt.show()
+
+def run_kmeans(df, k=8):
+
+    coords = df.dropna(subset=["latitude", "longitude"])[["latitude", "longitude"]]
+
+    if coords.empty:
+        df["cluster"] = np.nan
+        print("\nNo lat/long data available for clustering.")
+        return df
+
+    scaler = StandardScaler()
+    scaled = scaler.fit_transform(coords)
+
+    kmeans = KMeans(n_clusters=k, random_state=42, n_init="auto")
+    labels = kmeans.fit_predict(scaled)
+
+    df = df.copy()
+    df.loc[coords.index, "cluster"] = labels
+
+    return df
+
+
+def summarize_clusters(df):
+
+    print("\n K-MEANS CLUSTER SUMMARY")
+
+    for cluster_id in sorted(df["cluster"].dropna().unique()):
+
+        subset = df[df["cluster"] == cluster_id]
+
+        print(f"\nCluster {int(cluster_id)} (n = {len(subset):,})")
+        print("Borough breakdown:")
+        print(subset["borough"].value_counts())
+
+        print("\nTop complaint types:")
+        print(subset["complaint_type"].value_counts().head(5))
+
+def run_anova_ancova(ts):
+
+        # Basic sanity checks
+    n_rows = len(ts)
+    n_boroughs = ts["borough"].nunique()
+    n_time = ts["time_index"].nunique()
+
+    print(f"\nANOVA/ANCOVA sanity check: rows={n_rows}, boroughs={n_boroughs}, time_points={n_time}")
+
+    # Need at least a bit more data than parameters: ~ (boroughs + 1)
+    if n_rows <= n_boroughs + 1:
+        print("Not enough data points for ANOVA/ANCOVA (too few month–borough combos). Skipping.")
+        return
+
+    # ONE-WAY ANOVA
+    try:
+        print("ONE-WAY ANOVA: complaint_count ~ borough")
+        model_anova = smf.ols("complaint_count ~ C(borough)", data=ts).fit()
+        print(sm.stats.anova_lm(model_anova, typ=2))
+    except Exception as e:
+        print("ANOVA failed:", e)
+
+    # ANCOVA
+    if n_time <= 1:
+        print("\nNot enough distinct time points for ANCOVA (time_index is constant). Skipping ANCOVA.")
+        return
+
+    try:
+
+        print("ANCOVA: complaint_count ~ borough + time_index")
+        model_ancova = smf.ols("complaint_count ~ C(borough) + time_index", data=ts).fit()
+        print(sm.stats.anova_lm(model_ancova, typ=2))
+    except Exception as e:
+        print("ANCOVA failed:", e)
+
+    print("\nInterpretation guide:")
+    print("- ANOVA: significant borough effect → some boroughs have systematically higher monthly complaint levels.")
+    print("- ANCOVA: significant time_index effect → complaints are changing over time (up or down),")
+    print("  controlling for borough differences.")
+
+
+def main():
+
+    print("Fetching NYC 311 complaints (2018–2024)...")
+    df_raw = fetch_311_data_by_years(start_year=2018, end_year=2024, per_year_limit=25000)
+
+    print(f"\nTotal rows fetched: {len(df_raw):,}")
+
+    df = clean_311(df_raw)
+    print(f"Rows after cleaning: {len(df):,}")
+
+    if not df.empty:
+        # Call the new function to save data
+        save_data_to_csv(df, filename='cleaned_311_data.csv')
+
+        # TOP 8 COMPLAINT TYPES
+        # -----------------------------------
+        print("\n=== TOP 8 COMPLAINT TYPES (2018–2024) ===")
+        print_top_8_by_borough(df)
+
+        # TIME SERIES
+        # -----------------------------------
+        ts = build_time_series(df)
+        print("\n=== SAMPLE TIME SERIES ROWS ===")
+        print(ts.head())
+
+        print("\nPlotting time series...")
+        plot_time_series(ts)
+
+
+        # K-MEANS SPATIAL CLUSTERING
+        # -----------------------------------
+        print("\nRunning spatial clustering...")
+        df_clustered = run_kmeans(df, k=8)
+        summarize_clusters(df_clustered)
+
+        # ANOVA + ANCOVA
+        # -----------------------------------
+        print("\nRunning ANOVA + ANCOVA...")
+        run_anova_ancova(ts)
+    else:
+        print("\nNo data to process after cleaning. Skipping analysis steps.")
+
+main()
