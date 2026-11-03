@@ -1,8 +1,7 @@
 # Results
 
 ## Overview
-This project analyzes large-scale civic service request data to identify structural patterns of housing-related distress and evaluate whether statistical and analytical techniques can be used to **predict risk before harm escalates**. Using exploratory analysis, regression, and analysis of variance (ANOVA), the results demonstrate that housing distress is **measurable, non-random, and systematically concentrated** across time and geography.  
-:contentReference[oaicite:0]{index=0}
+This project analyzes large-scale civic service request data to identify structural patterns of housing-related distress and evaluate whether statistical and analytical techniques can be used to **predict risk before harm escalates**. Using exploratory analysis, regression, and analysis of variance (ANOVA), the results demonstrate that housing distress is **measurable, non-random, and systematically concentrated** across time and geography.
 
 ---
 
